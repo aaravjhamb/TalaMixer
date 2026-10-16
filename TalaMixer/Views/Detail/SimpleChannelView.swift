@@ -127,12 +127,17 @@ struct SimpleChannelView: View {
             HStack(alignment: .top, spacing: 0) {
                 if let index = stripID.headampIndex,
                    let headamp = client.state.headamps.first(where: { $0.index == index }) {
+                    // Remapped onto the Scarlett-style range; desk values below
+                    // its floor just park the knob at the bottom.
                     Knob(title: "Gain",
-                         scale: P.headampGain,
-                         wire: headamp.gainWire,
+                         scale: P.simpleHeadampGain,
+                         wire: P.simpleHeadampGain.wire(fromValue: headamp.gainDB),
                          format: { XAirFormat.gain($0) },
                          diameter: 72,
-                         onChange: { client.setHeadampGain(index, wire: $0) },
+                         onChange: {
+                             let db = P.simpleHeadampGain.value(fromWire: $0)
+                             client.setHeadampGain(index, wire: P.headampGain.wire(fromValue: db))
+                         },
                          onEnded: { client.endGesture(XAirAddress.headampGain(index)) })
                         .frame(maxWidth: .infinity)
 

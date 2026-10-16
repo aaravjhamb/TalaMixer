@@ -13,6 +13,10 @@ enum P {
     static let highPassFilter = XAirScale.logarithmic(20, 400)
     static let usbTrim = XAirScale.linear(-18, 18)
     static let headampGain = XAirScale.linear(-12, 60)
+    /// Simple mode's gain knob, laid out like a Scarlett's: no useless low end,
+    /// so the bottom of travel already passes signal and 12 o'clock lands near
+    /// typical mic gain (~+35 dB). Drives the same /headamp gain.
+    static let simpleHeadampGain = XAirScale.linear(10, 60)
 
     // Gate
     static let gateThreshold = XAirScale.linear(-80, 0)

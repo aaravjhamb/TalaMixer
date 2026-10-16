@@ -14,6 +14,8 @@ enum OSCLinkState: Equatable {
     case idle
     case connecting
     case ready
+    /// No route yet (Wi-Fi still coming up, say). The socket keeps trying.
+    case waiting(String)
     case failed(String)
 }
 
@@ -73,7 +75,7 @@ final class OSCTransport: OSCLink {
                 self.receiveNext()
             case .waiting(let error):
                 // UDP "waiting" usually means no route yet — surface it but keep trying.
-                self.onState?(.failed(Self.describe(error)))
+                self.onState?(.waiting(Self.describe(error)))
             case .failed(let error):
                 self.onState?(.failed(Self.describe(error)))
             case .cancelled:

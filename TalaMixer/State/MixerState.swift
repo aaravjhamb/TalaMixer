@@ -563,5 +563,6 @@ final class MixerState {
     func invalidate() {
         for id in stripOrder { strips[id]?.isSynced = false }
         meters.reset()
+        info = DeskInfo()
     }
 }

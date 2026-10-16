@@ -56,6 +56,21 @@ final class XAirClient {
     private var syncTimer: Timer?
     private var meterFallbackWork: DispatchWorkItem?
 
+    /// Re-sends /xinfo until the desk answers, then gives up after
+    /// `handshakeTimeout`. UDP has no handshake of its own: the socket reports
+    /// "ready" as soon as there's a route, whether or not a mixer is listening.
+    private var handshakeTimer: Timer?
+    private var handshakeStarted: Date?
+
+    /// Watches for the desk going quiet after we've been talking to it.
+    private var livenessTimer: Timer?
+    private var lastInbound: Date?
+    private var lastProbe: Date?
+
+    /// True once the desk has sent us anything at all this session. Nothing is
+    /// reported as connected until then.
+    private var hasHeardFromDesk = false
+
     /// Latest value per address, waiting to go out on the next flush.
     private var outbox: [String: OSCValue] = [:]
     private var outboxOrder: [String] = []
@@ -84,6 +99,11 @@ final class XAirClient {
     private let keepAliveInterval: TimeInterval = 7     // subscriptions expire at 10 s
     private let syncInterval: TimeInterval = 0.012      // one burst every 12 ms
     private let syncBurstSize = 6
+    private let handshakeRetry: TimeInterval = 0.5      // /xinfo re-send cadence
+    private let handshakeTimeout: TimeInterval = 4      // then declare nobody home
+    private let livenessCheck: TimeInterval = 1         // silence watchdog cadence
+    private let probeAfterSilence: TimeInterval = 4     // poke the desk after this
+    private let lostAfterSilence: TimeInterval = 10     // give up after this
 
     // MARK: - Lifecycle
 
@@ -109,12 +129,21 @@ final class XAirClient {
     }
 
     func disconnect() {
+        teardown()
+        status = .disconnected
+    }
+
+    /// Drops the link and every bit of per-session state, leaving `status`
+    /// alone so a failure reason can survive the teardown.
+    private func teardown() {
         keepAliveTimer?.invalidate(); keepAliveTimer = nil
         flushTimer?.invalidate(); flushTimer = nil
         syncTimer?.invalidate(); syncTimer = nil
+        handshakeTimer?.invalidate(); handshakeTimer = nil
+        livenessTimer?.invalidate(); livenessTimer = nil
         meterFallbackWork?.cancel(); meterFallbackWork = nil
 
-        if link != nil {
+        if link != nil, hasHeardFromDesk {
             send(OSCMessage(XAirAddress.unsubscribe), immediate: true)
         }
         link?.onMessage = nil
@@ -126,34 +155,81 @@ final class XAirClient {
         outboxOrder.removeAll()
         recentWrites.removeAll()
         syncQueue.removeAll()
+        syncTotal = 0
         deepSynced.removeAll()
         hasSeenMeters = false
+        hasHeardFromDesk = false
         isSessionReady = false
+        handshakeStarted = nil
+        lastInbound = nil
+        lastProbe = nil
 
         state.invalidate()
-        status = .disconnected
+    }
+
+    /// Gives up on the current link and shows why. Keeps `host` so the user
+    /// can retry from the connection panel.
+    private func fail(_ reason: String) {
+        teardown()
+        status = .failed(reason)
     }
 
     private func handleLinkState(_ linkState: OSCLinkState) {
         switch linkState {
         case .idle:
-            if status.isLive { status = .disconnected }
+            if status.isLive || status == .connecting { status = .disconnected }
         case .connecting:
             status = .connecting
         case .ready:
-            beginSession()
+            // For UDP this only means "we have a route". Stay in `.connecting`
+            // until the desk actually answers.
+            guard link != nil, !isSessionReady else { return }
+            beginHandshake()
+        case .waiting(let reason):
+            // Socket is still trying; show why, but don't tear anything down.
+            if !hasHeardFromDesk { status = .failed(reason) }
         case .failed(let reason):
-            status = .failed(reason)
+            fail(reason)
         }
     }
 
-    /// Identify the desk, subscribe, then pull the state the mixer view needs.
-    private func beginSession() {
-        status = .syncing(progress: 0)
+    /// Asks the desk to identify itself and keeps asking until it does.
+    private func beginHandshake() {
         isSessionReady = true
-        sessionID += 1
+        status = .connecting
+        handshakeStarted = Date()
+        sendHandshakeProbe()
+
+        handshakeTimer?.invalidate()
+        handshakeTimer = Timer.scheduledTimer(withTimeInterval: handshakeRetry, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.handshakeTick() }
+        }
+    }
+
+    private func sendHandshakeProbe() {
         send(OSCMessage(XAirAddress.xinfo), immediate: true)
         send(OSCMessage(XAirAddress.status), immediate: true)
+    }
+
+    private func handshakeTick() {
+        guard !hasHeardFromDesk else {
+            handshakeTimer?.invalidate(); handshakeTimer = nil
+            return
+        }
+        if let started = handshakeStarted, Date().timeIntervalSince(started) >= handshakeTimeout {
+            fail("No mixer answering at \(host)")
+            return
+        }
+        sendHandshakeProbe()
+    }
+
+    /// Runs once, on the first packet the desk sends us: subscribe, then pull
+    /// the state the mixer view needs.
+    private func beginSession() {
+        handshakeTimer?.invalidate(); handshakeTimer = nil
+        hasHeardFromDesk = true
+        status = .syncing(progress: 0)
+        sessionID += 1
 
         renewSubscriptions()
         subscribeToMeters()
@@ -161,11 +237,30 @@ final class XAirClient {
         keepAliveTimer = Timer.scheduledTimer(withTimeInterval: keepAliveInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.renewSubscriptions() }
         }
+        livenessTimer = Timer.scheduledTimer(withTimeInterval: livenessCheck, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.livenessTick() }
+        }
 
         // Give /xinfo a moment to land so the model (and therefore the strip
         // list) is right before we build the query list.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.startSurfaceSync()
+            guard let self, self.hasHeardFromDesk else { return }
+            self.startSurfaceSync()
+        }
+    }
+
+    /// Meters stream constantly, so a desk that's gone quiet has gone away:
+    /// unplugged, powered off, or the Wi-Fi dropped. Poke it once before
+    /// deciding, in case meters are the only thing that stopped.
+    private func livenessTick() {
+        guard let lastInbound else { return }
+        let silence = Date().timeIntervalSince(lastInbound)
+        if silence >= lostAfterSilence {
+            fail("Lost contact with the mixer at \(host)")
+        } else if silence >= probeAfterSilence,
+                  lastProbe.map({ Date().timeIntervalSince($0) >= probeAfterSilence }) ?? true {
+            lastProbe = Date()
+            send(OSCMessage(XAirAddress.xinfo), immediate: true)
         }
     }
 
@@ -232,6 +327,10 @@ final class XAirClient {
     // MARK: - Inbound
 
     private func receive(_ message: OSCMessage) {
+        guard link != nil, isSessionReady else { return }
+        lastInbound = Date()
+        if !hasHeardFromDesk { beginSession() }
+
         var message = message
         // Aliased subscription replies can come back without a leading slash.
         if !message.address.hasPrefix("/") {
@@ -253,10 +352,6 @@ final class XAirClient {
         }
 
         state.apply(message)
-
-        if case .syncing = status, syncQueue.isEmpty {
-            status = .connected
-        }
     }
 
     // MARK: - Outbound
@@ -450,15 +545,15 @@ final class XAirClient {
         syncTotal = max(syncTotal, syncQueue.count)
         guard syncTimer == nil else { return }
 
-        status = .syncing(progress: 0)
+        if hasHeardFromDesk { status = .syncing(progress: 0) }
         syncTimer = Timer.scheduledTimer(withTimeInterval: syncInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.drainSyncQueue() }
         }
     }
 
     private func drainSyncQueue() {
-        // Hold the queue until the desk can actually answer.
-        guard isSessionReady, let link else { return }
+        // Hold the queue until the desk has actually answered us.
+        guard hasHeardFromDesk, let link else { return }
         guard !syncQueue.isEmpty else {
             syncTimer?.invalidate(); syncTimer = nil
             syncTotal = 0
